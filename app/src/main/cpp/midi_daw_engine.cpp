@@ -11,6 +11,7 @@
 
 #define MAX_CHANNELS 16
 #define BUFFER_SIZE_COEFF 2
+#define DELAY_BUFFER_SIZE 48000 // 1-second maximum loop delay buffer at 48kHz
 
 struct AudioChannel {
     const float* sampleData = nullptr;
@@ -27,6 +28,11 @@ public:
         for (int i = 0; i < MAX_CHANNELS; ++i) {
             mChannels[i].isPlaying.store(false);
         }
+        // Initialize delay circuit memory map arrays
+        mDelayBufferLeft.resize(DELAY_BUFFER_SIZE, 0.0f);
+        mDelayBufferRight.resize(DELAY_BUFFER_SIZE, 0.0f);
+        mDelayFeedback.store(0.4f); // 40% feedback tail repetition rate
+        mDelayWetLevel.store(0.3f);  // 30% wet mix volume footprint
     }
 
     void start() {
@@ -89,9 +95,22 @@ public:
                 chan.currentPosition.store(currentPos + 1);
             }
 
-            output[frame * totalChannels] = accumLeft;
+            // --- Native Zero-Latency Echo/Delay Processing Circuit ---
+            int32_t delayedIndex = (mDelayWriteIndex + DELAY_BUFFER_SIZE - 12000) % DELAY_BUFFER_SIZE; // Fixed 250ms echo step offset
+            float wetLeft = mDelayBufferLeft[delayedIndex] * mDelayWetLevel.load();
+            float wetRight = mDelayBufferRight[delayedIndex] * mDelayWetLevel.load();
+
+            // Store current input mixed with decaying feedback tail accumulation values
+            mDelayBufferLeft[mDelayWriteIndex] = accumLeft + (mDelayBufferLeft[delayedIndex] * mDelayFeedback.load());
+            mDelayBufferRight[mDelayWriteIndex] = accumRight + (mDelayBufferRight[delayedIndex] * mDelayFeedback.load());
+            
+            // Advance writing index seamlessly through ring cycle boundaries
+            mDelayWriteIndex = (mDelayWriteIndex + 1) % DELAY_BUFFER_SIZE;
+
+            // Output mixed signal combining clean audio input and processed echo effects data
+            output[frame * totalChannels] = accumLeft + wetLeft;
             if (totalChannels > 1) {
-                output[frame * totalChannels + 1] = accumRight;
+                output[frame * totalChannels + 1] = accumRight + wetRight;
             }
         }
         return oboe::DataCallbackResult::Continue;
@@ -100,6 +119,13 @@ public:
 private:
     std::shared_ptr<oboe::AudioStream> mStream;
     std::vector<AudioChannel> mChannels;
+    
+    // Low-overhead storage vectors for echo and spatial effects
+    std::vector<float> mDelayBufferLeft;
+    std::vector<float> mDelayBufferRight;
+    int32_t mDelayWriteIndex = 0;
+    std::atomic<float> mDelayFeedback;
+    std::atomic<float> mDelayWetLevel;
 };
 
 static MidiDawEngine *engineInstance = nullptr;
